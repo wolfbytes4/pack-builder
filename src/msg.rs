@@ -4,7 +4,10 @@ use cosmwasm_std::{
    Addr, Binary, Uint128
 };
 use secret_toolkit::{ 
-    permit:: { Permit }
+    permit:: { Permit },
+    snip721::{
+        Trait
+    }
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -14,16 +17,23 @@ pub struct InstantiateMsg {
     pub is_payment_needed: bool,
     pub valid_payments: Option<Vec<PaymentContractInfo>>,
     pub receiving_address: Addr,
-    pub pack_max: i32,
-    pub collection_size: i32,
-    pub level_cap: i32,
-    pub levels: Vec<Level>
+    pub pack_max: u16,
+    pub collection_size: u16,
+    pub level_cap: u16,
+    pub levels: Vec<Level>,
+    pub ranks: Vec<Rank>
 } 
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct Level {
-    pub level: i32,
-    pub xp_needed: i32
+    pub level: u16,
+    pub xp_needed: u32
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct Rank {
+    pub token_id: String,
+    pub rank: u16
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -40,22 +50,64 @@ pub struct PaymentContractInfo {
     pub code_hash: String,
     /// contract's address
     pub address: Addr,
-    pub payment_needed: Uint128
+    pub payment_needed: Uint128,
+    pub name: String
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct HistoryToken {
-    pub wolf_token_id: String,
-    pub powerup_token_ids: Vec<String>, 
-    pub pack_build_date: Option<u64>, 
-    pub power_up_amount: i32
+    pub wolf_main_token_id: String,
+    pub pack_member_token_ids: Vec<String>, 
+    pub pack_build_date: Option<u64>
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct PackBuildMsg {
-    pub main_token_id: String
+    pub main_token_id: String,
+    pub name: String
 }
-   
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PackTransferMsg {
+    pub main_token_id: String,
+    pub transfer_to_token_id: String,
+    pub token_id: String,
+    pub member_index: u8 
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PackMember {
+    pub token_id: String,
+    pub rank: u16,
+    pub attributes: Vec<Trait>
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PackMain {
+    pub token_id: String,
+    pub pack_rank: u32,
+    pub pack_count: u16,
+    pub name: String
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct BuildInfoResponse {
+    pub pack_max: u16,
+    pub total_burned: u16,
+    pub valid_payments: Option<Vec<PaymentContractInfo>>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HandleReceiveMsg {
+    ReceivePackBuild {
+        pack_build: PackBuildMsg
+    },
+    ReceiveTransferBuild {
+        transfer_build: PackTransferMsg
+    },
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecuteMsg { 
@@ -83,15 +135,26 @@ pub enum ExecuteMsg {
 #[serde(rename_all = "snake_case")]
 pub enum QueryMsg {   
     GetPackBuildInfo {},
+    GetNumUserHistory{
+        permit: Permit
+    },
     GetUserHistory { 
         permit: Permit,
         start_page: u32, 
         page_size: u32 
     },
-    GetNumUserHistory{
-        permit: Permit
+    GetNumPacks {},
+    GetPacks {
+        start_page: u32,
+        page_size: u32 
+    },
+    GetPackMembers{
+        main_token_id: String
+    },
+    GetPackMembersTraits{
+        main_token_id: String
     }
-}
+} 
 
 // We define a custom struct for each query response
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
