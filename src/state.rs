@@ -28,6 +28,7 @@ pub static LEVEL_ITEM: Item<Vec<Level>> = Item::new(LEVEL_KEY);
 pub static RANK_STORE: Keymap<String, u16> = Keymap::new(RANK_KEY);
 pub static PACK_MAIN_STORE: Keymap<String, PackMain> = Keymap::new(PACK_KEY);
 pub static PACK_MEMBER_STORE: Keymap<String, Vec<PackMember>> = Keymap::new(PACK_MEMBER_KEY);
+pub static INHOLDING_NFT_STORE: Keymap<CanonicalAddr, Vec<String>> = Keymap::new(INHOLDING_NFT_KEY);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct State {  

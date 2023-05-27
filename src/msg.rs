@@ -62,6 +62,11 @@ pub struct HistoryToken {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct ReceiveMsg {
+    pub quantity: u16
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct PackBuildMsg {
     pub main_token_id: String,
     pub name: String
@@ -103,9 +108,9 @@ pub enum HandleReceiveMsg {
     ReceivePackBuild {
         pack_build: PackBuildMsg
     },
-    ReceiveTransferBuild {
-        transfer_build: PackTransferMsg
-    },
+    // ReceiveTransferBuild {
+    //     transfer_build: PackTransferMsg
+    // },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -125,9 +130,17 @@ pub enum ExecuteMsg {
         token_ids: Vec<String>,
         msg: Option<Binary>
     },
+    // ClaimBack{  
+    // },
     SendNftBack{ 
         token_id: String,
         owner: Addr
+    },
+    AddPayment{ 
+        payment: PaymentContractInfo
+    },
+    RemovePayment{
+        payment_name: String
     }
 }
 
@@ -153,6 +166,9 @@ pub enum QueryMsg {
     },
     GetPackMembersTraits{
         main_token_id: String
+    },
+    GetHolding{
+        addr: Addr
     }
 } 
 

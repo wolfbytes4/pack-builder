@@ -4,8 +4,8 @@ use cosmwasm_std::{
     Binary, CosmosMsg, Uint128
 };
 use crate::error::ContractError;
-use crate::msg::{ HandleReceiveMsg, ExecuteMsg, PackBuildMsg, PackTransferMsg, InstantiateMsg, QueryMsg, HistoryToken, PackMain, PackMember, BuildInfoResponse };
-use crate::state::{ State, CONFIG_ITEM, LEVEL_ITEM, PAID_ADDRESSES_ITEM, RANK_STORE, PACK_MAIN_STORE, PACK_MEMBER_STORE, ADMIN_ITEM, MY_ADDRESS_ITEM, PREFIX_REVOKED_PERMITS, HISTORY_STORE};
+use crate::msg::{ HandleReceiveMsg, ExecuteMsg, ReceiveMsg, PackBuildMsg, PackTransferMsg, InstantiateMsg, QueryMsg, HistoryToken, PackMain, PackMember, BuildInfoResponse, PaymentContractInfo };
+use crate::state::{ State, CONFIG_ITEM, LEVEL_ITEM, PAID_ADDRESSES_ITEM, RANK_STORE, INHOLDING_NFT_STORE, PACK_MAIN_STORE, PACK_MEMBER_STORE, ADMIN_ITEM, MY_ADDRESS_ITEM, PREFIX_REVOKED_PERMITS, HISTORY_STORE};
 use crate::rand::{sha_256};
 use secret_toolkit::{
     snip20::{ transfer_msg },
@@ -103,6 +103,12 @@ pub fn execute(
         ExecuteMsg::RevokePermit { permit_name } => {
             try_revoke_permit(deps, &info.sender, &permit_name)
         },
+        ExecuteMsg::AddPayment { payment } => {
+            try_add_payment(deps, &info.sender, payment)
+        },
+        ExecuteMsg::RemovePayment { payment_name } => {
+            try_remove_payment(deps, &info.sender, payment_name)
+        },
         ExecuteMsg::BatchReceiveNft { from, token_ids, msg } => {
             try_batch_receive(deps, _env, &info.sender, &from, token_ids, msg)
         },
@@ -112,6 +118,9 @@ pub fn execute(
             amount,
             msg
         } => receive(deps, _env, &info.sender, &sender, &from, amount, msg),
+        // ExecuteMsg::ClaimBack {} => {
+        //     try_claim_back(deps, _env, &info.sender)
+        // },
         ExecuteMsg::SendNftBack { token_id, owner } => {
             try_send_nft_back(deps, _env, &info.sender, token_id, owner)
         }
@@ -128,27 +137,35 @@ fn receive(
     msg: Option<Binary>
 ) -> Result<Response, ContractError> { 
     deps.api.debug(&format!("Receive received"));
+
     let state = CONFIG_ITEM.load(deps.storage)?;
     let payment_contract = state.valid_payments.as_ref().unwrap().iter().find(|&x| &x.address == info_sender);
-    if !payment_contract.is_some(){
-        return Err(ContractError::CustomError {val: info_sender.to_string() + &" Address is not correct snip contract".to_string()});  
-    }  
 
-    if payment_contract.unwrap().payment_needed != amount {
-        return Err(ContractError::CustomError {val: "You've sent the wrong amount".to_string()});  
+    if let Some(bin) = msg { 
+        let bytes = base64::decode(bin.to_base64()).unwrap();
+        let rmsg: ReceiveMsg = serde_json::from_slice(&bytes).unwrap();
+        if !payment_contract.is_some(){
+            return Err(ContractError::CustomError {val: info_sender.to_string() + &" Address is not correct snip contract".to_string()});  
+        }  
+
+        if payment_contract.unwrap().payment_needed * Uint128::from(rmsg.quantity) != amount {
+            return Err(ContractError::CustomError {val: "You've sent the wrong amount".to_string()});  
+        }
+
+        let sender_raw = deps.api.addr_canonicalize(&sender.to_string())?; 
+        let mut paid_addresses = PAID_ADDRESSES_ITEM.load(deps.storage)?;
+
+        if paid_addresses.iter().any(|x| x == &sender_raw){
+            return Err(ContractError::CustomError {val: sender.to_string() + &" Address is already building".to_string()});  
+        } 
+        
+        paid_addresses.push(sender_raw);
+
+        PAID_ADDRESSES_ITEM.save(deps.storage, &paid_addresses)?;
     }
-
-    let sender_raw = deps.api.addr_canonicalize(&sender.to_string())?; 
-    let mut paid_addresses = PAID_ADDRESSES_ITEM.load(deps.storage)?;
-
-    if paid_addresses.iter().any(|x| x == &sender_raw){
-        return Err(ContractError::CustomError {val: sender.to_string() + &" Address is already building".to_string()});  
+    else{
+        return Err(ContractError::CustomError {val: "Invalid message received".to_string()});
     } 
-    
-    paid_addresses.push(sender_raw);
-
-    PAID_ADDRESSES_ITEM.save(deps.storage, &paid_addresses)?;
-    
     Ok(Response::new()
     .add_message(transfer_msg(
         state.receiving_address.to_string(),
@@ -171,11 +188,6 @@ fn try_batch_receive(
     msg: Option<Binary>,
 ) -> Result<Response, ContractError> { 
     deps.api.debug(&format!("Batch received"));
-    //TODO: 
-    // Function to move wolf to another alpha 
-    // function to add/remove payment method and if payment is needed
-    // Queries
-    //   - Get History, Get distinct traits, Get Pack info, Get Leaderboard
 
     if let Some(bin_msg) = msg {
         match from_binary(&bin_msg)? {
@@ -187,14 +199,14 @@ fn try_batch_receive(
                 token_ids,
                 pack_build
             ),
-            HandleReceiveMsg::ReceiveTransferBuild{ transfer_build } => transfer_pack(
-                _env,
-                deps,
-                sender,
-                from, 
-                token_ids,
-                transfer_build
-            )
+            // HandleReceiveMsg::ReceiveTransferBuild{ transfer_build } => transfer_pack(
+            //     _env,
+            //     deps,
+            //     sender,
+            //     from, 
+            //     token_ids,
+            //     transfer_build
+            // )
         }
     } else {
         return Err(ContractError::CustomError {val: "data should be given".to_string()});
@@ -440,17 +452,6 @@ pub fn join_pack(
         )?;
         response_msgs.push(cosmos_msg); 
 
-        // add transfer update to responses
-        let cosmos_transfer_msg = transfer_nft_msg(
-            from.to_string(),
-            pmsg.main_token_id.to_string(),
-            None,
-            None,
-            BLOCK_SIZE,
-            state.nft_contract.code_hash.to_string(),
-            state.nft_contract.address.to_string()
-        )?;
-        response_msgs.push(cosmos_transfer_msg);
         //enter history record
         let history_token: HistoryToken = { HistoryToken {
             wolf_main_token_id: pmsg.main_token_id.to_string(),
@@ -467,281 +468,305 @@ pub fn join_pack(
         return Err(ContractError::CustomError {val: "Not a valid contract address".to_string()});
      }  
  
+    // add transfer update to responses 
+    response_msgs.push(transfer_nft_msg(
+        from.to_string(),
+        pmsg.main_token_id.to_string(),
+        None,
+        None,
+        BLOCK_SIZE,
+        state.nft_contract.code_hash.to_string(),
+        state.nft_contract.address.to_string()
+    )?);
    Ok(Response::new().add_messages(response_msgs).add_attributes(response_attrs))
 }
 
-pub fn transfer_pack(
-    _env: Env,
-    deps: DepsMut,
-    sender: &Addr,
-    from: &Addr,
-    token_ids: Vec<String>, 
-    pmsg: PackTransferMsg
-) -> Result<Response, ContractError> {
-    let mut response_msgs: Vec<CosmosMsg> = Vec::new();  
-    let state = CONFIG_ITEM.load(deps.storage)?;    
-    let mut pack_member = PackMember{ token_id: "".to_string(), rank: 0, attributes: Vec::new()};
-    // pub main_token_id: String,
-    // pub transfer_to_token_id: String,
-    // pub token_id: String
-    // Check to make sure main_token_id exists in list and remove from the list
-    if !token_ids.iter().any(|x| x == &pmsg.main_token_id){
-        return Err(ContractError::CustomError {val: "Main Token is not in the list".to_string()}); 
-    } 
+// pub fn transfer_pack(
+//     _env: Env,
+//     deps: DepsMut,
+//     sender: &Addr,
+//     from: &Addr,
+//     token_ids: Vec<String>, 
+//     pmsg: PackTransferMsg
+// ) -> Result<Response, ContractError> {
+//     let mut response_msgs: Vec<CosmosMsg> = Vec::new();  
+//     let state = CONFIG_ITEM.load(deps.storage)?;    
+//     let mut pack_member = PackMember{ token_id: "".to_string(), rank: 0, attributes: Vec::new()};
 
-    if !token_ids.iter().any(|x| x == &pmsg.transfer_to_token_id){
-        return Err(ContractError::CustomError {val: "Transfer To Token is not in the list".to_string()}); 
-    }
+//     let holding: Vec<String> = INHOLDING_NFT_STORE.get(deps.storage,&deps.api.addr_canonicalize(&from.to_string())?).unwrap_or(Vec::new());
+//     if holding.len() != 0
+//     {
+//         return Err(ContractError::CustomError {val: "You need to claim back first".to_string()});
+//     }
+//     if !token_ids.iter().any(|x| x == &pmsg.main_token_id){
+//         return Err(ContractError::CustomError {val: "Main Token is not in the list".to_string()}); 
+//     } 
+
+//     if !token_ids.iter().any(|x| x == &pmsg.transfer_to_token_id){
+//         return Err(ContractError::CustomError {val: "Transfer To Token is not in the list".to_string()}); 
+//     }
  
 
-    let mut main_pack_members = PACK_MEMBER_STORE.get(deps.storage, &pmsg.main_token_id).ok_or_else(|| StdError::generic_err("This tokenid doesn't exist"))?;
-    let mut transfer_to_pack_members = PACK_MEMBER_STORE.get(deps.storage, &pmsg.transfer_to_token_id).unwrap_or_else(Vec::new);
-    let pos = main_pack_members.iter().position(|x| x.token_id == pmsg.token_id);
-    if pos.is_none(){
-        return Err(ContractError::CustomError {val: "Token is not a pack member".to_string()});  
-    }
-    else{
-        pack_member = main_pack_members.remove(pos.unwrap());
-        transfer_to_pack_members.push(pack_member.clone());
-    }
+//     let mut main_pack_members = PACK_MEMBER_STORE.get(deps.storage, &pmsg.main_token_id).ok_or_else(|| StdError::generic_err("This tokenid doesn't exist"))?;
+//     let mut transfer_to_pack_members = PACK_MEMBER_STORE.get(deps.storage, &pmsg.transfer_to_token_id).unwrap_or_else(Vec::new);
+//     let pos = main_pack_members.iter().position(|x| x.token_id == pmsg.token_id);
+//     if pos.is_none(){
+//         return Err(ContractError::CustomError {val: "Token is not a pack member".to_string()});  
+//     }
+//     else{
+//         pack_member = main_pack_members.remove(pos.unwrap());
+//         transfer_to_pack_members.push(pack_member.clone());
+//     }
     
         
-    PACK_MEMBER_STORE.insert(deps.storage, &pmsg.main_token_id, &main_pack_members)?;
-    PACK_MEMBER_STORE.insert(deps.storage, &pmsg.transfer_to_token_id, &transfer_to_pack_members)?;
+//     PACK_MEMBER_STORE.insert(deps.storage, &pmsg.main_token_id, &main_pack_members)?;
+//     PACK_MEMBER_STORE.insert(deps.storage, &pmsg.transfer_to_token_id, &transfer_to_pack_members)?;
      
  
     
-    if sender == &state.nft_contract.address{ 
+//     if sender == &state.nft_contract.address{ 
 
-        let history_store = HISTORY_STORE.add_suffix(from.to_string().as_bytes());
+//         let history_store = HISTORY_STORE.add_suffix(from.to_string().as_bytes());
        
-        // Get viewing key for NFTs
-        let viewer = Some(ViewerInfo {
-            address: _env.contract.address.to_string(),
-            viewing_key: state.viewing_key.as_ref().unwrap().to_string(),
-        });
+//         // Get viewing key for NFTs
+//         let viewer = Some(ViewerInfo {
+//             address: _env.contract.address.to_string(),
+//             viewing_key: state.viewing_key.as_ref().unwrap().to_string(),
+//         });
 
-        let main_meta: NftDossier =  nft_dossier_query(
-            deps.querier,
-            pmsg.main_token_id.to_string(),
-            viewer.clone(),
-            None,
-            BLOCK_SIZE,
-            state.nft_contract.code_hash.clone(),
-            state.nft_contract.address.to_string(),
-        )?;
+//         let main_meta: NftDossier =  nft_dossier_query(
+//             deps.querier,
+//             pmsg.main_token_id.to_string(),
+//             viewer.clone(),
+//             None,
+//             BLOCK_SIZE,
+//             state.nft_contract.code_hash.clone(),
+//             state.nft_contract.address.to_string(),
+//         )?;
 
-        let transfer_to_meta: NftDossier =  nft_dossier_query(
-            deps.querier,
-            pmsg.transfer_to_token_id.to_string(),
-            viewer.clone(),
-            None,
-            BLOCK_SIZE,
-            state.nft_contract.code_hash.clone(),
-            state.nft_contract.address.to_string(),
-        )?;
-        let main_alpha_trait = main_meta.public_metadata.as_ref().unwrap().extension.as_ref().unwrap().attributes.as_ref().unwrap().iter().find(|&x| x.trait_type == Some("Alpha".to_string()));
-        if main_alpha_trait.is_none(){
-            return Err(ContractError::CustomError {val: "You can't do this action with a non-alpha".to_string()});  
-        } 
-        let transfer_to_alpha_trait = transfer_to_meta.public_metadata.as_ref().unwrap().extension.as_ref().unwrap().attributes.as_ref().unwrap().iter().find(|&x| x.trait_type == Some("Alpha".to_string()));
-        if transfer_to_alpha_trait.is_none(){
-            return Err(ContractError::CustomError {val: "You can't do this action with a non-alpha".to_string()});  
-        }  
-        let mut pub_media_file = MediaFile::default();
-        let mut priv_media_file = MediaFile::default();
+//         let transfer_to_meta: NftDossier =  nft_dossier_query(
+//             deps.querier,
+//             pmsg.transfer_to_token_id.to_string(),
+//             viewer.clone(),
+//             None,
+//             BLOCK_SIZE,
+//             state.nft_contract.code_hash.clone(),
+//             state.nft_contract.address.to_string(),
+//         )?;
+//         let main_alpha_trait = main_meta.public_metadata.as_ref().unwrap().extension.as_ref().unwrap().attributes.as_ref().unwrap().iter().find(|&x| x.trait_type == Some("Alpha".to_string()));
+//         if main_alpha_trait.is_none(){
+//             return Err(ContractError::CustomError {val: "You can't do this action with a non-alpha".to_string()});  
+//         } 
+//         let transfer_to_alpha_trait = transfer_to_meta.public_metadata.as_ref().unwrap().extension.as_ref().unwrap().attributes.as_ref().unwrap().iter().find(|&x| x.trait_type == Some("Alpha".to_string()));
+//         if transfer_to_alpha_trait.is_none(){
+//             return Err(ContractError::CustomError {val: "You can't do this action with a non-alpha".to_string()});  
+//         }  
+//         let mut pub_media_file = MediaFile::default();
+//         let mut priv_media_file = MediaFile::default();
 
-        //update public metadata first
-        let new_public_ext = 
-                if let Some(Metadata { extension, .. }) = main_meta.public_metadata {
-                    if let Some(mut ext) = extension {  
-                        //remove image of token being transfered
-                        pub_media_file = ext.media.as_mut().unwrap().remove((pmsg.member_index+1)as usize);
-                        //update rank
-                        let mut new_pack_rank: u32 = 0;
-                        let mut new_pack_size: u16 = 0;
+//         //update public metadata first
+//         let new_public_ext = 
+//                 if let Some(Metadata { extension, .. }) = main_meta.public_metadata {
+//                     if let Some(mut ext) = extension {  
+//                         //remove image of token being transfered
+//                         pub_media_file = ext.media.as_mut().unwrap().remove((pmsg.member_index+1)as usize);
+//                         //update rank
+//                         let mut new_pack_rank: u32 = 0;
+//                         let mut new_pack_size: u16 = 0;
                         
-                        for attr in ext.attributes.as_mut().unwrap().iter_mut() {
+//                         for attr in ext.attributes.as_mut().unwrap().iter_mut() {
  
-                            if attr.trait_type == Some("Pack".to_string()) {
-                                new_pack_size = attr.value.parse::<u16>().unwrap() - 1;
-                                attr.value = new_pack_size.to_string(); 
-                            }
+//                             if attr.trait_type == Some("Pack".to_string()) {
+//                                 new_pack_size = attr.value.parse::<u16>().unwrap() - 1;
+//                                 attr.value = new_pack_size.to_string(); 
+//                             }
 
-                            if attr.trait_type == Some("Pack Rank".to_string()) { 
-                                new_pack_rank = attr.value.parse::<u32>().unwrap() - (state.collection_size - pack_member.rank)as u32;
-                                attr.value = new_pack_rank.to_string();  
-                            } 
-                        }
-                        let mut pack_main = PACK_MAIN_STORE.get(deps.storage, &pmsg.main_token_id).unwrap();
-                        pack_main.pack_rank = new_pack_rank;
-                        pack_main.pack_count = new_pack_size;
+//                             if attr.trait_type == Some("Pack Rank".to_string()) { 
+//                                 new_pack_rank = attr.value.parse::<u32>().unwrap() - (state.collection_size - pack_member.rank)as u32;
+//                                 attr.value = new_pack_rank.to_string();  
+//                             } 
+//                         }
+//                         let mut pack_main = PACK_MAIN_STORE.get(deps.storage, &pmsg.main_token_id).unwrap();
+//                         pack_main.pack_rank = new_pack_rank;
+//                         pack_main.pack_count = new_pack_size;
              
-                        //update store for the leaderboard
-                        PACK_MAIN_STORE.insert(deps.storage, &pmsg.main_token_id, &pack_main)?;
+//                         //update store for the leaderboard
+//                         PACK_MAIN_STORE.insert(deps.storage, &pmsg.main_token_id, &pack_main)?;
 
-                        ext 
-                   }
-                    else {
-                        return Err(ContractError::CustomError {val: "unable to set metadata with uri".to_string()});
-                    }
-                } 
-                else {
-                    return Err(ContractError::CustomError {val: "unable to get metadata from nft contract".to_string()});
-                };
+//                         ext 
+//                    }
+//                     else {
+//                         return Err(ContractError::CustomError {val: "unable to set metadata with uri".to_string()});
+//                     }
+//                 } 
+//                 else {
+//                     return Err(ContractError::CustomError {val: "unable to get metadata from nft contract".to_string()});
+//                 };
              
    
-        let new_private_ext = 
-                if let Some(Metadata { extension, .. }) = main_meta.private_metadata {
-                    if let Some(mut ext) = extension {  
-                        priv_media_file = ext.media.as_mut().unwrap().remove(pmsg.member_index as usize);
-                        ext 
-                   }
-                    else {
-                        return Err(ContractError::CustomError {val: "unable to set metadata with uri".to_string()});
-                    }
-                } 
-                else {
-                    return Err(ContractError::CustomError {val: "unable to get metadata from nft contract".to_string()});
-                };
+//         let new_private_ext = 
+//                 if let Some(Metadata { extension, .. }) = main_meta.private_metadata {
+//                     if let Some(mut ext) = extension {  
+//                         priv_media_file = ext.media.as_mut().unwrap().remove(pmsg.member_index as usize);
+//                         ext 
+//                    }
+//                     else {
+//                         return Err(ContractError::CustomError {val: "unable to set metadata with uri".to_string()});
+//                     }
+//                 } 
+//                 else {
+//                     return Err(ContractError::CustomError {val: "unable to get metadata from nft contract".to_string()});
+//                 };
  
-        let mut pack_member_token_ids: Vec<String> = Vec::new();
-        pack_member_token_ids.push(pmsg.token_id.clone());
-        //enter history record
-        let history_token: HistoryToken = { HistoryToken {
-            wolf_main_token_id: pmsg.transfer_to_token_id.to_string(),
-            pack_member_token_ids: pack_member_token_ids,
-            pack_build_date: Some(_env.block.time.seconds())
-        }};
+//         let mut pack_member_token_ids: Vec<String> = Vec::new();
+//         pack_member_token_ids.push(pmsg.token_id.clone());
+//         //enter history record
+//         let history_token: HistoryToken = { HistoryToken {
+//             wolf_main_token_id: pmsg.transfer_to_token_id.to_string(),
+//             pack_member_token_ids: pack_member_token_ids,
+//             pack_build_date: Some(_env.block.time.seconds())
+//         }};
         
-        history_store.push(deps.storage, &history_token)?;
+//         history_store.push(deps.storage, &history_token)?;
 
-        //move member to new alpha
-        let new_transfer_public_ext = 
-        if let Some(Metadata { extension, .. }) = transfer_to_meta.public_metadata {
-            if let Some(mut ext) = extension {   
-                ext.media.as_mut().unwrap().push(pub_media_file.clone());
-                //add pack rank attribute to the public metadata if it doesnt exist
-                if !ext.attributes.as_mut().unwrap().iter().any(|x| x.trait_type == Some("Pack Rank".to_string())){
-                    ext.attributes.as_mut().unwrap().push(Trait{
-                        trait_type: Some("Pack Rank".to_string()),
-                        value: "0".to_string(),
-                        display_type: None,
-                        max_value: None
-                    });
-                } 
-                //update rank
-                let mut new_pack_rank: u32 = 0;
-                let mut new_pack_size: u16 = 0;
+//         //move member to new alpha
+//         let new_transfer_public_ext = 
+//         if let Some(Metadata { extension, .. }) = transfer_to_meta.public_metadata {
+//             if let Some(mut ext) = extension {   
+//                 ext.media.as_mut().unwrap().push(pub_media_file.clone());
+//                 //add pack rank attribute to the public metadata if it doesnt exist
+//                 if !ext.attributes.as_mut().unwrap().iter().any(|x| x.trait_type == Some("Pack Rank".to_string())){
+//                     ext.attributes.as_mut().unwrap().push(Trait{
+//                         trait_type: Some("Pack Rank".to_string()),
+//                         value: "0".to_string(),
+//                         display_type: None,
+//                         max_value: None
+//                     });
+//                 } 
+//                 //update rank
+//                 let mut new_pack_rank: u32 = 0;
+//                 let mut new_pack_size: u16 = 0;
                 
-                for attr in ext.attributes.as_mut().unwrap().iter_mut() {
+//                 for attr in ext.attributes.as_mut().unwrap().iter_mut() {
 
-                    if attr.trait_type == Some("Pack".to_string()) {
-                        new_pack_size = attr.value.parse::<u16>().unwrap() + 1;
-                        attr.value = new_pack_size.to_string(); 
-                    }
+//                     if attr.trait_type == Some("Pack".to_string()) {
+//                         new_pack_size = attr.value.parse::<u16>().unwrap() + 1;
+//                         attr.value = new_pack_size.to_string(); 
+//                     }
 
-                    if attr.trait_type == Some("Pack Rank".to_string()) { 
-                        new_pack_rank = attr.value.parse::<u32>().unwrap() + (state.collection_size - pack_member.rank) as u32;
-                        attr.value = new_pack_rank.to_string();  
-                    } 
-                }
-                let mut pack_transfer_to = PACK_MAIN_STORE.get(deps.storage, &pmsg.transfer_to_token_id)
-                .unwrap_or(PackMain{
-                    token_id: pmsg.transfer_to_token_id.to_string(),
-                    pack_rank:  0,
-                    pack_count: 0,
-                    name: "".to_string()
-                });
-                pack_transfer_to.pack_rank = new_pack_rank;
-                pack_transfer_to.pack_count = new_pack_size;
+//                     if attr.trait_type == Some("Pack Rank".to_string()) { 
+//                         new_pack_rank = attr.value.parse::<u32>().unwrap() + (state.collection_size - pack_member.rank) as u32;
+//                         attr.value = new_pack_rank.to_string();  
+//                     } 
+//                 }
+//                 let mut pack_transfer_to = PACK_MAIN_STORE.get(deps.storage, &pmsg.transfer_to_token_id)
+//                 .unwrap_or(PackMain{
+//                     token_id: pmsg.transfer_to_token_id.to_string(),
+//                     pack_rank:  0,
+//                     pack_count: 0,
+//                     name: "".to_string()
+//                 });
+//                 pack_transfer_to.pack_rank = new_pack_rank;
+//                 pack_transfer_to.pack_count = new_pack_size;
      
-                //update store for the leaderboard 
-                PACK_MAIN_STORE.insert(deps.storage, &pmsg.transfer_to_token_id, &pack_transfer_to)?;
+//                 //update store for the leaderboard 
+//                 PACK_MAIN_STORE.insert(deps.storage, &pmsg.transfer_to_token_id, &pack_transfer_to)?;
                 
-                ext 
-           }
-            else {
-                return Err(ContractError::CustomError {val: "unable to set metadata with uri".to_string()});
-            }
-        } 
-        else {
-            return Err(ContractError::CustomError {val: "unable to get metadata from nft contract".to_string()});
-        };
+//                 ext 
+//            }
+//             else {
+//                 return Err(ContractError::CustomError {val: "unable to set metadata with uri".to_string()});
+//             }
+//         } 
+//         else {
+//             return Err(ContractError::CustomError {val: "unable to get metadata from nft contract".to_string()});
+//         };
 
-        let new_transfer_privat_ext = 
-        if let Some(Metadata { extension, .. }) = transfer_to_meta.private_metadata {
-            if let Some(mut ext) = extension {  
-                ext.media.as_mut().unwrap().push(priv_media_file.clone());
-                ext 
-           }
-            else {
-                return Err(ContractError::CustomError {val: "unable to set metadata with uri".to_string()});
-            }
-        } 
-        else {
-            return Err(ContractError::CustomError {val: "unable to get metadata from nft contract".to_string()});
-        };
+//         let new_transfer_privat_ext = 
+//         if let Some(Metadata { extension, .. }) = transfer_to_meta.private_metadata {
+//             if let Some(mut ext) = extension {  
+//                 ext.media.as_mut().unwrap().push(priv_media_file.clone());
+//                 ext 
+//            }
+//             else {
+//                 return Err(ContractError::CustomError {val: "unable to set metadata with uri".to_string()});
+//             }
+//         } 
+//         else {
+//             return Err(ContractError::CustomError {val: "unable to get metadata from nft contract".to_string()});
+//         };
 
-                //add metadata update to responses 
-                response_msgs.push(
-                    set_metadata_msg(
-                        pmsg.main_token_id.to_string(),
-                        Some(Metadata {
-                            token_uri: None,
-                            extension: Some(new_public_ext),
-                        }),
-                        Some(Metadata {
-                            token_uri: None,
-                            extension: Some(new_private_ext),
-                        }), 
-                        None,
-                        BLOCK_SIZE,
-                        state.nft_contract.code_hash.clone(),
-                        state.nft_contract.address.to_string()
-                    )?
-                );  
-                response_msgs.push(
-                    set_metadata_msg(
-                        pmsg.transfer_to_token_id.to_string(),
-                        Some(Metadata {
-                            token_uri: None,
-                            extension: Some(new_transfer_public_ext),
-                        }),
-                        Some(Metadata {
-                            token_uri: None,
-                            extension: Some(new_transfer_privat_ext),
-                        }), 
-                        None,
-                        BLOCK_SIZE,
-                        state.nft_contract.code_hash.clone(),
-                        state.nft_contract.address.to_string()
-                    )?
-                ); 
-
-                let mut transfers: Vec<Transfer> = Vec::new();
-                transfers.push(
-                    Transfer{
-                        recipient: from.to_string(),
-                        token_ids: token_ids,
-                        memo: None
-                    }
-                );
-             
-                response_msgs.push(batch_transfer_nft_msg(
-                    transfers,
-                    None,
-                    BLOCK_SIZE,
-                    state.nft_contract.code_hash.clone(),
-                    state.nft_contract.address.to_string(),
-                )?); 
-     }
-     else{
-        return Err(ContractError::CustomError {val: "Not a valid contract address".to_string()});
-     }  
+//                 //add metadata update to responses 
+//                 response_msgs.push(
+//                     set_metadata_msg(
+//                         pmsg.main_token_id.to_string(),
+//                         Some(Metadata {
+//                             token_uri: None,
+//                             extension: Some(new_public_ext),
+//                         }),
+//                         Some(Metadata {
+//                             token_uri: None,
+//                             extension: Some(new_private_ext),
+//                         }), 
+//                         None,
+//                         BLOCK_SIZE,
+//                         state.nft_contract.code_hash.clone(),
+//                         state.nft_contract.address.to_string()
+//                     )?
+//                 );  
+//                 response_msgs.push(
+//                     set_metadata_msg(
+//                         pmsg.transfer_to_token_id.to_string(),
+//                         Some(Metadata {
+//                             token_uri: None,
+//                             extension: Some(new_transfer_public_ext),
+//                         }),
+//                         Some(Metadata {
+//                             token_uri: None,
+//                             extension: Some(new_transfer_privat_ext),
+//                         }), 
+//                         None,
+//                         BLOCK_SIZE,
+//                         state.nft_contract.code_hash.clone(),
+//                         state.nft_contract.address.to_string()
+//                     )?
+//                 ); 
+//                 INHOLDING_NFT_STORE.insert(deps.storage, &deps.api.addr_canonicalize(&from.to_string())?, &token_ids)?; 
+//      }
+//      else{
+//         return Err(ContractError::CustomError {val: "Not a valid contract address".to_string()});
+//      }  
  
-   Ok(Response::new().add_messages(response_msgs))
-}
+//    Ok(Response::new().add_messages(response_msgs))
+// }
+
+// pub fn try_claim_back(
+//     deps: DepsMut,
+//     _env: Env,
+//     sender: &Addr
+// ) -> Result<Response, ContractError> {  
+//     let state = CONFIG_ITEM.load(deps.storage)?;
+//     let alphas: Vec<String> = INHOLDING_NFT_STORE.get(deps.storage,&deps.api.addr_canonicalize(&sender.to_string())?).ok_or_else(|| StdError::generic_err("no tokens found"))?;
+//     let mut transfers: Vec<Transfer> = Vec::new();
+//                 transfers.push(
+//                     Transfer{
+//                         recipient: sender.to_string(),
+//                         token_ids: alphas,
+//                         memo: None
+//                     }
+//                 );
+//     INHOLDING_NFT_STORE.remove(deps.storage, &deps.api.addr_canonicalize(&sender.to_string())?)?;         
+
+//     Ok(Response::new()
+//         .add_message(batch_transfer_nft_msg(
+//             transfers,
+//             None,
+//             BLOCK_SIZE,
+//             state.nft_contract.code_hash.clone(),
+//             state.nft_contract.address.to_string(),
+//         )?)
+//     )
+// }
 
 pub fn try_send_nft_back(
     deps: DepsMut,
@@ -779,6 +804,56 @@ fn try_revoke_permit(
     Ok(Response::default())
 }
 
+fn try_add_payment(
+    deps: DepsMut,
+    sender: &Addr,
+    payment: PaymentContractInfo
+) -> Result<Response, ContractError> { 
+    let mut state = CONFIG_ITEM.load(deps.storage)?;
+
+    if sender.clone() != state.owner {
+        return Err(ContractError::CustomError {val: "You don't have the permissions to execute this command".to_string()});
+    }  
+
+    if state.valid_payments.is_none() {
+        state.valid_payments = Some(vec![]);
+    }
+    let payment_contract = state.valid_payments.as_ref().unwrap().iter().find(|x| x.name == payment.name);
+    if payment_contract.is_some(){
+        return Err(ContractError::CustomError {val: "This payment name already exists".to_string()});  
+    }  
+    state.valid_payments.unwrap().push(payment);
+    Ok(Response::default())
+}
+
+fn try_remove_payment(
+    deps: DepsMut,
+    sender: &Addr,
+    payment_name: String,
+) -> Result<Response, ContractError> {
+    let mut state = CONFIG_ITEM.load(deps.storage)?;
+
+    if sender.clone() != state.owner {
+        return Err(ContractError::CustomError {val: "You don't have the permissions to execute this command".to_string()});
+    }  
+
+    if state.valid_payments.is_none() {
+        return Err(ContractError::CustomError {val: "No valid payments exist".to_string()});
+    }
+
+    let position = state.valid_payments.as_ref().unwrap().iter().position(|x| x.name == payment_name);
+         
+    if position.is_none(){
+        return Err(ContractError::CustomError {val: "Payment name doesn't exist".to_string()});  
+    }
+    else{ 
+        state.valid_payments.as_mut().unwrap().remove(position.unwrap());
+    }
+    
+    CONFIG_ITEM.save(deps.storage, &state)?;
+    Ok(Response::default())
+}
+
 #[entry_point]
 pub fn query(
     deps: Deps,
@@ -792,7 +867,8 @@ pub fn query(
         QueryMsg::GetNumPacks { } => to_binary(&query_num_packs(deps)?),
         QueryMsg::GetPacks { start_page, page_size } => to_binary(&query_packs(deps, start_page, page_size)?),
         QueryMsg::GetPackMembers { main_token_id } => to_binary(&query_pack_members(deps, main_token_id )?),
-        QueryMsg::GetPackMembersTraits { main_token_id } => to_binary(&query_pack_member_traits(deps, main_token_id )?)
+        QueryMsg::GetPackMembersTraits { main_token_id } => to_binary(&query_pack_member_traits(deps, main_token_id )?),
+        QueryMsg::GetHolding { addr } => to_binary(&query_holding(deps, addr)?),
     }
 }
 
@@ -874,6 +950,14 @@ fn query_pack_member_traits(
         }
     }
     Ok(distinct_traits)
+}
+
+fn query_holding(
+    deps: Deps, 
+    addr: Addr
+) -> StdResult<Vec<String>> { 
+    let holding: Vec<String> = INHOLDING_NFT_STORE.get(deps.storage,&deps.api.addr_canonicalize(&addr.to_string())?).unwrap_or(Vec::new());
+    Ok(holding)
 }
 
 fn get_querier(
